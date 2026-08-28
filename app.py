@@ -189,7 +189,7 @@ def process_customer_message(sender_id: str, user_text: str):
     CONVERSATION_HISTORY[sender_id] = f"{prev_context}\nCustomer: {user_text}\nAssistant: {reply_text}"[-1500:]
     send_fb_message(sender_id, reply_text)
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {"status": "Tasty Mushroom Bot is Running Live!"}
 
