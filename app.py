@@ -15,9 +15,10 @@ PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "")
 TELEGRAM_BOT_TOKEN = "8922611949:AAEhdH9PmWGKz2U1JVk4g3zmH5fAQZa6UOQ"
 TELEGRAM_CHAT_ID = "1310445351"
 META_VERIFY_TOKEN = "TASTY_MUSHROOM_SECRET_TOKEN"
+APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzowUPiPjGgho6fAyYIsuPinYNGuD_5yZf8fRVb9Ew40WgQM-nS5gDfIsiszf2yAwza/exec"
 
 # ডাটা ট্র্যাকিং
-PROCESSED_MESSAGE_IDS = set()  # ডুপ্লিকেট মেসেজ রোধ করতে
+PROCESSED_MESSAGE_IDS = set()  # ডুপ্লিকেট রোধ
 PAUSED_USERS = {}              # { sender_id: paused_until_timestamp }
 CONVERSATION_HISTORY = {}      # { sender_id: "হিস্ট্রি টেক্সট" }
 DAILY_CUSTOMERS = {}           # { "YYYY-MM-DD": { sender_id: time } }
@@ -33,10 +34,10 @@ if GEMINI_API_KEY:
         print(f"Gemini Client Init Error: {e}")
 
 SYSTEM_INSTRUCTION = """
-তুমি 'Tasty Mushroom'-এর প্রফেশনাল ও আন্তরিক কাস্টমার সার্ভিস অ্যাসিস্ট্যান্ট।
+তুমি 'Tasty Mushroom'-এর প্রফেশনাল, আন্তরিক ও কাস্টমার-বান্ধব এআই অ্যাসিস্ট্যান্ট।
 ঠিকানা: ০৪ নং ওয়ার্ড, আগারের পার, কুকরুল, রংপুর সিটি কর্পোরেশন, রংপুর।
 
-প্রোডাক্ট ও দাম:
+প্রোডাক্ট ও বর্তমান দাম:
 - Fresh Mushroom (তাজা মাশরুম): ৪০০ টাকা/কেজি (৫০০ গ্রাম = ২০০ টাকা)
 - Dry Mushroom (শুকনা মাশরুম): ২০০০ টাকা/কেজি
 - Mushroom Chips (মাশরুম চিপস): ২৫ টাকা/পিস (বা প্যাকেটভেদে ১০০ টাকা)
@@ -44,9 +45,13 @@ SYSTEM_INSTRUCTION = """
 - Spawn (বীজ): ৩০ টাকা/পিস, Mother Spawn: ৪০ টাকা/পিস
 - ডেলিভারি চার্জ: রংপুর সিটির ভেতরে ৩০-৬০ টাকা।
 
+কাস্টমার নার্সিং ও ফলোআপ নিয়ম:
+- পুরাতন কাস্টমার খোঁজখবর নিলে আন্তরিকভাবে কথা বলবে, মাশরুমের পুষ্টিগুণ ও ফ্রেশ ব্যাচের আপডেট জানাবে।
+- রিভিউ বা মতামত দিলে ধন্যবাদ জানাবে।
+
 অর্ডার নেওয়ার নিয়ম:
 কাস্টমারের নাম, মোবাইল নম্বর, ঠিকানা এবং পণ্যের নাম ও পরিমাণ নিশ্চিত হলে সরাসরি অর্ডারটি কনফার্ম করবে এবং ধন্যবাদ জানাবে।
-এবং উত্তরের একদম শেষে অবশ্যই নিচের ট্যাগটি নিখুঁতভাবে যুক্ত করবে:
+এবং উত্তরের একদম শেষে অবশ্যই নিচের ট্যাগটি নিখুঁতভাবে যুক্ত করবে (কোনো পরিবর্তন ছাড়া):
 :::ORDER_CONFIRMED:::{"name": "...", "mobile": "...", "address": "...", "product": "...", "amount": "...", "note": "..."}:::END:::
 
 হ্যান্ডওভার নিয়ম:
@@ -58,6 +63,7 @@ def get_bd_time():
     return datetime.now(BD_TZ)
 
 def send_telegram_alert(html_text: str):
+    """টেলিগ্রামে এইচটিএমএল ফরম্যাটে এররমুক্ত অ্যালার্ট পাঠানো"""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -70,6 +76,7 @@ def send_telegram_alert(html_text: str):
         print(f"Telegram Alert Error: {e}")
 
 def send_fb_message(recipient_id: str, message_text: str):
+    """ফেসবুক মেসেঞ্জারে রিপ্লাই পাঠানো"""
     if not PAGE_ACCESS_TOKEN:
         print("ERROR: PAGE_ACCESS_TOKEN is missing!")
         return
@@ -84,8 +91,51 @@ def send_fb_message(recipient_id: str, message_text: str):
     except Exception as e:
         print(f"FB Message Send Exception: {e}")
 
+def sync_order_to_google_sheet(order_data: dict, sender_id: str):
+    """গুগল শিটের Leads_CRM-এ অর্ডার সেভ করা"""
+    if not APPS_SCRIPT_URL:
+        return
+    try:
+        payload = {
+            "name": order_data.get("name", ""),
+            "mobile": order_data.get("mobile", ""),
+            "address": order_data.get("address", ""),
+            "product": order_data.get("product", ""),
+            "amount": order_data.get("amount", ""),
+            "note": order_data.get("note", ""),
+            "sender_id": sender_id
+        }
+        res = requests.post(APPS_SCRIPT_URL, json=payload, timeout=15)
+        print(f"Google Sheet Order Sync Response: {res.text}")
+    except Exception as e:
+        print(f"Google Sheet Sync Error: {e}")
+
+def fetch_nursing_leads_from_sheet():
+    """শিট থেকে নার্সিং কাস্টমারদের তালিকা নিয়ে টেলিগ্রামে রিপোর্ট পাঠানো"""
+    if not APPS_SCRIPT_URL:
+        return
+    try:
+        url = f"{APPS_SCRIPT_URL}?api=customers"
+        res = requests.get(url, timeout=15)
+        if res.status_code == 200:
+            data = res.json()
+            customers = data.get("customers", [])
+            checkin_needed = [c for c in customers if str(c.get("needs_checkin", "")).lower() == "yes" or (isinstance(c.get("days_since"), (int, float)) and c.get("days_since") >= 15)]
+            
+            report = f"📋 <b>Tasty Mushroom কাস্টমার নার্সিং ও ফলোআপ লিস্ট</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+            report += f"👥 <b>ফলোআপ প্রয়োজন:</b> {len(checkin_needed)} জন কাস্টমার\n\n"
+            
+            for idx, c in enumerate(checkin_needed[:10], 1):
+                report += f"{idx}. <b>{c.get('name', 'N/A')}</b> ({c.get('mobile', 'N/A')})\n"
+                report += f"   • শেষ অর্ডার: {c.get('days_since', 'N/A')} দিন আগে\n"
+                report += f"   • মোট অর্ডার: {c.get('orders', 0)} টি | কেনাকাটা: {c.get('total_bdt', 0)} ৳\n\n"
+            
+            send_telegram_alert(report)
+    except Exception as e:
+        print(f"Nursing Fetch Error: {e}")
+
 def process_customer_message(sender_id: str, user_text: str):
-    """ব্যাকগ্রাউন্ডে নিরাপদে মেসেজ প্রসেস করা"""
+    """ব্যাকগ্রাউন্ডে এআই প্রসেসিং ও ডাটাবেজ আপডেট"""
     now_bd = get_bd_time()
     today_str = now_bd.strftime("%Y-%m-%d")
     current_time_str = now_bd.strftime("%I:%M %p")
@@ -96,7 +146,13 @@ def process_customer_message(sender_id: str, user_text: str):
     if sender_id not in DAILY_CUSTOMERS[today_str]:
         DAILY_CUSTOMERS[today_str][sender_id] = current_time_str
 
-    # কমান্ড: দৈনিক রিপোর্ট
+    # অ্যাডমিন কমান্ড: নার্সিং ও ফলোআপ
+    if user_text.lower() in ["#nursing", "#followup", "#winback"]:
+        fetch_nursing_leads_from_sheet()
+        send_fb_message(sender_id, "নার্সিং ও ফলোআপের কাস্টমার তালিকা টেলিগ্রামে পাঠানো হয়েছে।")
+        return
+
+    # অ্যাডমিন কমান্ড: দৈনিক রিপোর্ট
     if user_text.lower() == "#report":
         count = len(DAILY_CUSTOMERS[today_str])
         report_text = f"📊 <b>Tasty Mushroom ডেইলি রিপোর্ট ({today_str})</b>\n━━━━━━━━━━━━━━━━━━━━\n"
@@ -107,7 +163,7 @@ def process_customer_message(sender_id: str, user_text: str):
         send_fb_message(sender_id, f"আজকের মোট কাস্টমার: {count} জন। রিপোর্ট টেলিগ্রামে পাঠানো হয়েছে।")
         return
 
-    # কমান্ড: ম্যানুয়াল কন্ট্রোল
+    # অ্যাডমিন কমান্ড: কন্ট্রোল
     if user_text.lower() == "#stop":
         PAUSED_USERS[sender_id] = time.time() + (24 * 3600)
         send_fb_message(sender_id, "অটো-অ্যাসিস্ট্যান্ট বন্ধ করা হয়েছে। আমাদের প্রতিনিধি যোগাযোগ করবেন।")
@@ -128,7 +184,7 @@ def process_customer_message(sender_id: str, user_text: str):
     if client:
         try:
             response = client.models.generate_content(
-                model="gemini-3.6-flash",
+                model="gemini-2.5-flash",
                 contents=prompt_to_send,
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_INSTRUCTION,
@@ -162,7 +218,7 @@ def process_customer_message(sender_id: str, user_text: str):
         except Exception as e:
             print(f"Handover err: {e}")
 
-    # ২. অর্ডার কনফার্মেশন অ্যালার্ট
+    # ২. অর্ডার কনফার্মেশন ও গুগল শিট সিঙ্ক
     if ":::ORDER_CONFIRMED:::" in reply_text:
         try:
             parts = reply_text.split(":::ORDER_CONFIRMED:::")
@@ -170,6 +226,7 @@ def process_customer_message(sender_id: str, user_text: str):
             json_part = parts[1].split(":::END:::")[0].strip()
             order_data = json.loads(json_part)
 
+            # টেলিগ্রাম অ্যালার্ট
             alert_msg = (
                 "🚨 <b>নতুন অর্ডার প্রাপ্তি! (Tasty Mushroom)</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
@@ -179,9 +236,14 @@ def process_customer_message(sender_id: str, user_text: str):
                 f"🛒 <b>পণ্য ও পরিমাণ:</b> {order_data.get('product', 'N/A')}\n"
                 f"💰 <b>মূল্য/নোট:</b> {order_data.get('amount', 'N/A')} | {order_data.get('note', '')}\n"
                 f"⏰ <b>অর্ডারের সময়:</b> {current_time_str}\n"
-                "━━━━━━━━━━━━━━━━━━━━"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "✅ <i>অর্ডার স্বয়ংক্রিয়ভাবে গুগল শিটে সেভ করা হয়েছে।</i>"
             )
             send_telegram_alert(alert_msg)
+
+            # গুগল শিটে সেভ
+            sync_order_to_google_sheet(order_data, sender_id)
+
             reply_text = clean_reply
         except Exception as e:
             print(f"Order err: {e}")
@@ -218,7 +280,7 @@ async def handle_meta_webhook(request: Request, background_tasks: BackgroundTask
                     if "message" in messaging_event and "text" in messaging_event["message"]:
                         msg_id = messaging_event["message"].get("mid")
                         
-                        # ডুপ্লিকেট মেসেজ ফিল্টার (মেটা রিট্রাই করলেও দুইবার চলবে না)
+                        # ডুপ্লিকেট রোধ
                         if msg_id:
                             if msg_id in PROCESSED_MESSAGE_IDS:
                                 continue
@@ -227,7 +289,6 @@ async def handle_meta_webhook(request: Request, background_tasks: BackgroundTask
                                 PROCESSED_MESSAGE_IDS.clear()
 
                         user_text = messaging_event["message"]["text"].strip()
-                        # ব্যাকগ্রাউন্ডে প্রসেস হবে যাতে মেটা টাইমআউট না দেয়
                         background_tasks.add_task(process_customer_message, sender_id, user_text)
 
         return {"status": "EVENT_RECEIVED"}
