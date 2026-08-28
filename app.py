@@ -127,13 +127,13 @@ async def handle_meta_webhook(request: Request):
                         if client:
                             try:
                                 response = client.models.generate_content(
-                                    model="gemini-2.5-flash",
-                                    contents=user_text,
-                                    config=types.GenerateContentConfig(
-                                        system_instruction=SYSTEM_INSTRUCTION,
-                                        temperature=0.7
-                                    )
-                                )
+    model="gemini-3.6-flash",
+    contents=user_text,
+    config=types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        temperature=0.7
+    )
+)
                                 reply_text = response.text
                             except Exception as ge:
                                 print(f"Gemini API Error: {ge}")
