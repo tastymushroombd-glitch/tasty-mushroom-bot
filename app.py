@@ -1,9 +1,9 @@
 import os
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import requests
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from google import genai
 from google.genai import types
 
@@ -16,9 +16,14 @@ TELEGRAM_BOT_TOKEN = "8922611949:AAEhdH9PmWGKz2U1JVk4g3zmH5fAQZa6UOQ"
 TELEGRAM_CHAT_ID = "1310445351"
 META_VERIFY_TOKEN = "TASTY_MUSHROOM_SECRET_TOKEN"
 
-PAUSED_USERS = {}        # { sender_id: timestamp }
-CONVERSATION_HISTORY = {}  # { sender_id: "হিস্ট্রি টেক্সট" }
-DAILY_CUSTOMERS = {}     # { "YYYY-MM-DD": { sender_id: time } }
+# ডাটা ট্র্যাকিং
+PROCESSED_MESSAGE_IDS = set()  # ডুপ্লিকেট মেসেজ রোধ করতে
+PAUSED_USERS = {}              # { sender_id: paused_until_timestamp }
+CONVERSATION_HISTORY = {}      # { sender_id: "হিস্ট্রি টেক্সট" }
+DAILY_CUSTOMERS = {}           # { "YYYY-MM-DD": { sender_id: time } }
+
+# বাংলাদেশ টাইমজোন (UTC+6)
+BD_TZ = timezone(timedelta(hours=6))
 
 client = None
 if GEMINI_API_KEY:
@@ -49,6 +54,9 @@ SYSTEM_INSTRUCTION = """
 :::HANDOVER_NEEDED:::{"reason": "কাস্টমার প্রতিনিধির সাথে কথা বলতে চেয়েছেন"}:::END:::
 """
 
+def get_bd_time():
+    return datetime.now(BD_TZ)
+
 def send_telegram_alert(html_text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -57,8 +65,7 @@ def send_telegram_alert(html_text: str):
         "parse_mode": "HTML"
     }
     try:
-        res = requests.post(url, json=payload, timeout=10)
-        print(f"Telegram status: {res.status_code}")
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"Telegram Alert Error: {e}")
 
@@ -73,10 +80,114 @@ def send_fb_message(recipient_id: str, message_text: str):
         "messaging_type": "RESPONSE"
     }
     try:
-        res = requests.post(url, json=payload, timeout=10)
-        print(f"FB Send API Response: {res.status_code}")
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"FB Message Send Exception: {e}")
+
+def process_customer_message(sender_id: str, user_text: str):
+    """ব্যাকগ্রাউন্ডে নিরাপদে মেসেজ প্রসেস করা"""
+    now_bd = get_bd_time()
+    today_str = now_bd.strftime("%Y-%m-%d")
+    current_time_str = now_bd.strftime("%I:%M %p")
+
+    if today_str not in DAILY_CUSTOMERS:
+        DAILY_CUSTOMERS[today_str] = {}
+
+    if sender_id not in DAILY_CUSTOMERS[today_str]:
+        DAILY_CUSTOMERS[today_str][sender_id] = current_time_str
+
+    # কমান্ড: দৈনিক রিপোর্ট
+    if user_text.lower() == "#report":
+        count = len(DAILY_CUSTOMERS[today_str])
+        report_text = f"📊 <b>Tasty Mushroom ডেইলি রিপোর্ট ({today_str})</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        report_text += f"👥 <b>মোট কাস্টমার:</b> {count} জন\n\n"
+        for idx, (cid, ctime) in enumerate(DAILY_CUSTOMERS[today_str].items(), 1):
+            report_text += f"{idx}. ID: <code>{cid}</code> — সময়: {ctime}\n"
+        send_telegram_alert(report_text)
+        send_fb_message(sender_id, f"আজকের মোট কাস্টমার: {count} জন। রিপোর্ট টেলিগ্রামে পাঠানো হয়েছে।")
+        return
+
+    # কমান্ড: ম্যানুয়াল কন্ট্রোল
+    if user_text.lower() == "#stop":
+        PAUSED_USERS[sender_id] = time.time() + (24 * 3600)
+        send_fb_message(sender_id, "অটো-অ্যাসিস্ট্যান্ট বন্ধ করা হয়েছে। আমাদের প্রতিনিধি যোগাযোগ করবেন।")
+        return
+    elif user_text.lower() == "#start":
+        PAUSED_USERS.pop(sender_id, None)
+        send_fb_message(sender_id, "অটো-অ্যাসিস্ট্যান্ট পুনরায় চালু করা হয়েছে।")
+        return
+
+    # পজ স্ট্যাটাস চেক
+    if sender_id in PAUSED_USERS and time.time() < PAUSED_USERS[sender_id]:
+        return
+
+    prev_context = CONVERSATION_HISTORY.get(sender_id, "")
+    prompt_to_send = f"{prev_context}\nCustomer: {user_text}\nAssistant:"
+
+    reply_text = ""
+    if client:
+        try:
+            response = client.models.generate_content(
+                model="gemini-3.6-flash",
+                contents=prompt_to_send,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    temperature=0.7
+                )
+            )
+            reply_text = response.text
+        except Exception as ge:
+            print(f"Gemini API Error: {ge}")
+            reply_text = "আপনার মেসেজের জন্য ধন্যবাদ! কী পণ্য নিতে চান জানালে এখনই ব্যবস্থা নিচ্ছি।"
+    else:
+        reply_text = "Tasty Mushroom-এ স্বাগতম!"
+
+    # ১. হিউম্যান টেকওভার অ্যালার্ট
+    if ":::HANDOVER_NEEDED:::" in reply_text:
+        try:
+            parts = reply_text.split(":::HANDOVER_NEEDED:::")
+            reply_text = parts[0].strip()
+            PAUSED_USERS[sender_id] = time.time() + 1800
+            
+            alert = (
+                "⚠️ <b>হিউম্যান সাপোর্ট অ্যালার্ট!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>কাস্টমার আইডি:</b> <code>{sender_id}</code>\n"
+                f"💬 <b>মেসেজ:</b> {user_text}\n"
+                f"⏰ <b>সময়:</b> {current_time_str}\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "📌 <i>বট ৩০ মিনিটের জন্য পজ করা হয়েছে।</i>"
+            )
+            send_telegram_alert(alert)
+        except Exception as e:
+            print(f"Handover err: {e}")
+
+    # ২. অর্ডার কনফার্মেশন অ্যালার্ট
+    if ":::ORDER_CONFIRMED:::" in reply_text:
+        try:
+            parts = reply_text.split(":::ORDER_CONFIRMED:::")
+            clean_reply = parts[0].strip()
+            json_part = parts[1].split(":::END:::")[0].strip()
+            order_data = json.loads(json_part)
+
+            alert_msg = (
+                "🚨 <b>নতুন অর্ডার প্রাপ্তি! (Tasty Mushroom)</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>নাম:</b> {order_data.get('name', 'N/A')}\n"
+                f"📞 <b>মোবাইল:</b> {order_data.get('mobile', 'N/A')}\n"
+                f"📍 <b>ঠিকানা:</b> {order_data.get('address', 'N/A')}\n"
+                f"🛒 <b>পণ্য ও পরিমাণ:</b> {order_data.get('product', 'N/A')}\n"
+                f"💰 <b>মূল্য/নোট:</b> {order_data.get('amount', 'N/A')} | {order_data.get('note', '')}\n"
+                f"⏰ <b>অর্ডারের সময়:</b> {current_time_str}\n"
+                "━━━━━━━━━━━━━━━━━━━━"
+            )
+            send_telegram_alert(alert_msg)
+            reply_text = clean_reply
+        except Exception as e:
+            print(f"Order err: {e}")
+
+    CONVERSATION_HISTORY[sender_id] = f"{prev_context}\nCustomer: {user_text}\nAssistant: {reply_text}"[-1500:]
+    send_fb_message(sender_id, reply_text)
 
 @app.get("/")
 async def root():
@@ -93,12 +204,8 @@ async def verify_webhook(request: Request):
     return {"error": "Invalid verification token"}
 
 @app.post("/webhook")
-async def handle_meta_webhook(request: Request):
+async def handle_meta_webhook(request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    if today_str not in DAILY_CUSTOMERS:
-        DAILY_CUSTOMERS[today_str] = {}
-
     try:
         if data.get("object") == "page":
             for entry in data.get("entry", []):
@@ -109,102 +216,19 @@ async def handle_meta_webhook(request: Request):
                         continue
 
                     if "message" in messaging_event and "text" in messaging_event["message"]:
+                        msg_id = messaging_event["message"].get("mid")
+                        
+                        # ডুপ্লিকেট মেসেজ ফিল্টার (মেটা রিট্রাই করলেও দুইবার চলবে না)
+                        if msg_id:
+                            if msg_id in PROCESSED_MESSAGE_IDS:
+                                continue
+                            PROCESSED_MESSAGE_IDS.add(msg_id)
+                            if len(PROCESSED_MESSAGE_IDS) > 2000:
+                                PROCESSED_MESSAGE_IDS.clear()
+
                         user_text = messaging_event["message"]["text"].strip()
-                        current_time_str = datetime.now().strftime("%I:%M %p")
-
-                        if sender_id not in DAILY_CUSTOMERS[today_str]:
-                            DAILY_CUSTOMERS[today_str][sender_id] = current_time_str
-
-                        if user_text.lower() == "#report":
-                            count = len(DAILY_CUSTOMERS[today_str])
-                            report_text = f"📊 <b>Tasty Mushroom ডেইলি রিপোর্ট ({today_str})</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-                            report_text += f"👥 <b>মোট কাস্টমার:</b> {count} জন\n\n"
-                            for idx, (cid, ctime) in enumerate(DAILY_CUSTOMERS[today_str].items(), 1):
-                                report_text += f"{idx}. ID: <code>{cid}</code> — সময়: {ctime}\n"
-                            send_telegram_alert(report_text)
-                            send_fb_message(sender_id, f"আজকের মোট কাস্টমার: {count} জন। রিপোর্ট টেলিগ্রামে পাঠানো হয়েছে।")
-                            continue
-
-                        if user_text.lower() == "#stop":
-                            PAUSED_USERS[sender_id] = time.time() + (24 * 3600)
-                            send_fb_message(sender_id, "অটো-অ্যাসিস্ট্যান্ট বন্ধ করা হয়েছে।")
-                            continue
-                        elif user_text.lower() == "#start":
-                            PAUSED_USERS.pop(sender_id, None)
-                            send_fb_message(sender_id, "অটো-অ্যাসিস্ট্যান্ট পুনরায় চালু করা হয়েছে।")
-                            continue
-
-                        if sender_id in PAUSED_USERS and time.time() < PAUSED_USERS[sender_id]:
-                            continue
-
-                        # কথোপকথনের হিস্ট্রি একত্রিত করা
-                        prev_context = CONVERSATION_HISTORY.get(sender_id, "")
-                        prompt_to_send = f"{prev_context}\nCustomer: {user_text}\nAssistant:"
-
-                        reply_text = ""
-                        if client:
-                            try:
-                                response = client.models.generate_content(
-                                    model="gemini-3.6-flash",
-                                    contents=prompt_to_send,
-                                    config=types.GenerateContentConfig(
-                                        system_instruction=SYSTEM_INSTRUCTION,
-                                        temperature=0.7
-                                    )
-                                )
-                                reply_text = response.text
-                            except Exception as ge:
-                                print(f"Gemini API Error: {ge}")
-                                reply_text = "আপনার মেসেজের জন্য ধন্যবাদ! আপনার অর্ডারটি নিশ্চিত করতে সাহায্য করছি।"
-                        else:
-                            reply_text = "Tasty Mushroom-এ স্বাগতম!"
-
-                        # ১. হিউম্যান সাপোর্ট
-                        if ":::HANDOVER_NEEDED:::" in reply_text:
-                            try:
-                                parts = reply_text.split(":::HANDOVER_NEEDED:::")
-                                reply_text = parts[0].strip()
-                                PAUSED_USERS[sender_id] = time.time() + 1800
-                                
-                                alert = (
-                                    "⚠️ <b>হিউম্যান সাপোর্ট অ্যালার্ট!</b>\n"
-                                    "━━━━━━━━━━━━━━━━━━━━\n"
-                                    f"👤 <b>কাস্টমার আইডি:</b> <code>{sender_id}</code>\n"
-                                    f"💬 <b>মেসেজ:</b> {user_text}\n"
-                                    f"⏰ <b>সময়:</b> {current_time_str}"
-                                )
-                                send_telegram_alert(alert)
-                            except Exception as e:
-                                print(f"Handover err: {e}")
-
-                        # ২. অর্ডার কনফার্মেশন
-                        if ":::ORDER_CONFIRMED:::" in reply_text:
-                            try:
-                                parts = reply_text.split(":::ORDER_CONFIRMED:::")
-                                clean_reply = parts[0].strip()
-                                json_part = parts[1].split(":::END:::")[0].strip()
-                                order_data = json.loads(json_part)
-
-                                alert_msg = (
-                                    "🚨 <b>নতুন অর্ডার প্রাপ্তি! (Tasty Mushroom)</b>\n"
-                                    "━━━━━━━━━━━━━━━━━━━━\n"
-                                    f"👤 <b>নাম:</b> {order_data.get('name', 'N/A')}\n"
-                                    f"📞 <b>মোবাইল:</b> {order_data.get('mobile', 'N/A')}\n"
-                                    f"📍 <b>ঠিকানা:</b> {order_data.get('address', 'N/A')}\n"
-                                    f"🛒 <b>পণ্য ও পরিমাণ:</b> {order_data.get('product', 'N/A')}\n"
-                                    f"💰 <b>মূল্য/নোট:</b> {order_data.get('amount', 'N/A')} | {order_data.get('note', '')}\n"
-                                    "━━━━━━━━━━━━━━━━━━━━"
-                                )
-                                send_telegram_alert(alert_msg)
-                                reply_text = clean_reply
-                            except Exception as e:
-                                print(f"Order err: {e}")
-
-                        # হিস্ট্রি আপডেট
-                        CONVERSATION_HISTORY[sender_id] = f"{prev_context}\nCustomer: {user_text}\nAssistant: {reply_text}"[-1500:]
-
-                        # মেসেজ পাঠানো
-                        send_fb_message(sender_id, reply_text)
+                        # ব্যাকগ্রাউন্ডে প্রসেস হবে যাতে মেটা টাইমআউট না দেয়
+                        background_tasks.add_task(process_customer_message, sender_id, user_text)
 
         return {"status": "EVENT_RECEIVED"}
     except Exception as e:
